@@ -1897,6 +1897,14 @@ function Home() {
               <video ref={videoRefB} className="hidden" crossOrigin="anonymous" playsInline muted />
               <video ref={webcamVideoRef} className="hidden" playsInline muted />
               <audio ref={audioMusicRef} className="hidden" src={musicUrl} />
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleAddClipFiles}
+                multiple
+                accept="video/*"
+                className="hidden"
+              />
 
               {/* Composited Preview Canvas */}
               <canvas
