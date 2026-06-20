@@ -240,6 +240,19 @@ function Home() {
   const [selectedBaseVoice, setSelectedBaseVoice] = useState('Brian')
   const [isGeneratingTts, setIsGeneratingTts] = useState(false)
 
+  // AI Puppeteer States
+  const [isWebcamActive, setIsWebcamActive] = useState(false)
+  const [selectedAvatar, setSelectedAvatar] = useState<'robot' | 'kitty' | 'demon'>('robot')
+  const [isRecordingAvatar, setIsRecordingAvatar] = useState(false)
+  const [avatarRecordingDuration, setAvatarRecordingDuration] = useState(0)
+
+  const webcamVideoRef = useRef<HTMLVideoElement>(null)
+  const avatarCanvasRef = useRef<HTMLCanvasElement>(null)
+  const faceLandmarkerRef = useRef<any>(null)
+  const avatarRecorderRef = useRef<MediaRecorder | null>(null)
+  const avatarChunksRef = useRef<Blob[]>([])
+  const avatarAnimationRef = useRef<number | null>(null)
+
   // Global Timeline States
   const [isPlaying, setIsPlaying] = useState(false)
   const [globalTime, setGlobalTime] = useState(0)
@@ -1028,6 +1041,460 @@ function Home() {
     }
   }
 
+  // Initialize MediaPipe Face Landmarker
+  const initFaceLandmarker = async () => {
+    if (faceLandmarkerRef.current) return faceLandmarkerRef.current
+
+    try {
+      // Dynamic ES module import from CDN
+      const { FilesetResolver, FaceLandmarker } = await import(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/vision_bundle.mjs"
+      )
+
+      const filesetResolver = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.8/wasm"
+      )
+
+      const landmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          delegate: "GPU"
+        },
+        outputFaceBlendshapes: true,
+        runningMode: "VIDEO"
+      })
+
+      faceLandmarkerRef.current = landmarker
+      return landmarker
+    } catch (err) {
+      console.error("Failed to load FaceLandmarker:", err)
+      alert("Failed to load AI Face Tracker. Check your internet connection.")
+      throw err
+    }
+  }
+
+  // AI Puppeteer: Start Webcam and init tracking
+  const toggleWebcam = async () => {
+    if (isWebcamActive) {
+      stopWebcamTracking()
+    } else {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+        if (webcamVideoRef.current) {
+          webcamVideoRef.current.srcObject = stream
+          webcamVideoRef.current.onloadedmetadata = () => {
+            webcamVideoRef.current?.play()
+            setIsWebcamActive(true)
+            initFaceLandmarker().then((landmarker) => {
+              runPuppetLoop(landmarker)
+            })
+          }
+        }
+      } catch (e) {
+        console.error(e)
+        alert("Could not access camera or microphone. Please check permissions.")
+      }
+    }
+  }
+
+  // Stop Webcam tracking
+  const stopWebcamTracking = () => {
+    setIsWebcamActive(false)
+    if (avatarAnimationRef.current) {
+      cancelAnimationFrame(avatarAnimationRef.current)
+      avatarAnimationRef.current = null
+    }
+    if (webcamVideoRef.current && webcamVideoRef.current.srcObject) {
+      const stream = webcamVideoRef.current.srcObject as MediaStream
+      stream.getTracks().forEach(t => t.stop())
+      webcamVideoRef.current.srcObject = null
+    }
+  }
+
+  // Running the puppeteer frame loop
+  const runPuppetLoop = (landmarker: any) => {
+    const video = webcamVideoRef.current
+    const canvas = avatarCanvasRef.current
+    if (!video || !canvas) return
+
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+
+    canvas.width = 400
+    canvas.height = 400
+
+    let lastVideoTime = -1
+    const renderFrame = () => {
+      if (!webcamVideoRef.current || webcamVideoRef.current.paused || webcamVideoRef.current.ended) return
+
+      const timestamp = performance.now()
+      if (video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime
+        try {
+          const result = landmarker.detectForVideo(video, timestamp)
+          drawPuppet(ctx, canvas.width, canvas.height, result)
+        } catch (e) {
+          // ignore tracking frame errors
+        }
+      }
+      avatarAnimationRef.current = requestAnimationFrame(renderFrame)
+    }
+
+    avatarAnimationRef.current = requestAnimationFrame(renderFrame)
+  }
+
+  // Draw the selected puppet onto the canvas based on face landmarker results
+  const drawPuppet = (ctx: CanvasRenderingContext2D, width: number, height: number, result: any) => {
+    ctx.clearRect(0, 0, width, height)
+    
+    // Background color
+    ctx.fillStyle = '#0f172a'
+    ctx.fillRect(0, 0, width, height)
+
+    let blinkL = 0
+    let blinkR = 0
+    let mouthOpen = 0
+    let roll = 0
+    let yaw = 0
+    let pitch = 0
+
+    if (result.faceBlendshapes && result.faceBlendshapes[0]) {
+      const categories = result.faceBlendshapes[0].categories
+      const leftBlinkCat = categories.find((c: any) => c.categoryName === 'eyeBlinkLeft')
+      const rightBlinkCat = categories.find((c: any) => c.categoryName === 'eyeBlinkRight')
+      const jawOpenCat = categories.find((c: any) => c.categoryName === 'jawOpen')
+      if (leftBlinkCat) blinkL = leftBlinkCat.score
+      if (rightBlinkCat) blinkR = rightBlinkCat.score
+      if (jawOpenCat) mouthOpen = jawOpenCat.score
+    }
+
+    if (result.faceLandmarks && result.faceLandmarks[0]) {
+      const landmarks = result.faceLandmarks[0]
+      const eyeL = landmarks[33]
+      const eyeR = landmarks[263]
+      if (eyeL && eyeR) {
+        roll = Math.atan2(eyeR.y - eyeL.y, eyeR.x - eyeL.x)
+      }
+      const nose = landmarks[4]
+      const forehead = landmarks[10]
+      const chin = landmarks[152]
+      const cheekL = landmarks[234]
+      const cheekR = landmarks[454]
+      
+      if (nose && cheekL && cheekR) {
+        const dL = Math.hypot(nose.x - cheekL.x, nose.y - cheekL.y)
+        const dR = Math.hypot(nose.x - cheekR.x, nose.y - cheekR.y)
+        yaw = (dL - dR) / (dL + dR)
+      }
+      if (nose && forehead && chin) {
+        const dT = Math.hypot(forehead.x - nose.x, forehead.y - nose.y)
+        const dB = Math.hypot(chin.x - nose.x, chin.y - nose.y)
+        pitch = (dT - dB) / (dT + dB)
+      }
+    }
+
+    const cx = width / 2
+    const cy = height / 2 + 20
+
+    ctx.save()
+    // Apply head pose translations and rotations
+    ctx.translate(cx + (yaw * -40), cy + (pitch * -30))
+    ctx.rotate(roll)
+
+    if (selectedAvatar === 'robot') {
+      // Neck
+      ctx.fillStyle = '#1e293b'
+      ctx.strokeStyle = '#38bdf8'
+      ctx.lineWidth = 4
+      ctx.beginPath()
+      ctx.rect(-30, 40, 60, 40)
+      ctx.fill(); ctx.stroke()
+      
+      // Head casing
+      ctx.fillStyle = '#0f172a'
+      ctx.beginPath()
+      ctx.roundRect(-70, -80, 140, 130, 15)
+      ctx.fill(); ctx.stroke()
+
+      // Ears / Antennas
+      ctx.beginPath()
+      ctx.moveTo(-70, -20); ctx.lineTo(-85, -20); ctx.lineTo(-85, -30); ctx.closePath()
+      ctx.fill(); ctx.stroke()
+      ctx.beginPath()
+      ctx.moveTo(70, -20); ctx.lineTo(85, -20); ctx.lineTo(85, -30); ctx.closePath()
+      ctx.fill(); ctx.stroke()
+
+      // Visor
+      ctx.fillStyle = '#111827'
+      ctx.beginPath()
+      ctx.roundRect(-55, -45, 110, 30, 5)
+      ctx.fill(); ctx.stroke()
+
+      // Glowing Visor
+      ctx.strokeStyle = '#f43f5e'
+      ctx.lineWidth = 3
+      ctx.shadowColor = '#f43f5e'
+      ctx.shadowBlur = 10
+      
+      if (blinkL > 0.5 || blinkR > 0.5) {
+        ctx.beginPath()
+        ctx.moveTo(-45, -30); ctx.lineTo(-10, -30)
+        ctx.moveTo(10, -30); ctx.lineTo(45, -30)
+        ctx.stroke()
+      } else {
+        ctx.fillStyle = '#f43f5e'
+        ctx.beginPath()
+        ctx.ellipse(-25, -30, 12, 8, 0, 0, Math.PI * 2)
+        ctx.ellipse(25, -30, 12, 8, 0, 0, Math.PI * 2)
+        ctx.fill()
+      }
+      ctx.shadowBlur = 0
+
+      // Mouth Speaker
+      ctx.strokeStyle = '#38bdf8'
+      ctx.lineWidth = 4
+      ctx.shadowColor = '#38bdf8'
+      ctx.shadowBlur = 5
+      const mouthHeight = Math.max(2, mouthOpen * 25)
+      const barXOffsets = [-20, -10, 0, 10, 20]
+      barXOffsets.forEach((bx, idx) => {
+        const factor = idx % 2 === 0 ? 1.0 : 0.6
+        const h = mouthHeight * factor
+        ctx.beginPath()
+        ctx.moveTo(bx, 15 - h)
+        ctx.lineTo(bx, 15 + h)
+        ctx.stroke()
+      })
+      ctx.shadowBlur = 0
+    } 
+    else if (selectedAvatar === 'kitty') {
+      // Neck
+      ctx.fillStyle = '#e2e8f0'
+      ctx.strokeStyle = '#f472b6'
+      ctx.lineWidth = 4
+      ctx.beginPath()
+      ctx.rect(-20, 50, 40, 30)
+      ctx.fill(); ctx.stroke()
+
+      // Ears
+      ctx.fillStyle = '#cbd5e1'
+      ctx.beginPath()
+      ctx.moveTo(-65, -50); ctx.lineTo(-75, -110); ctx.lineTo(-20, -75); ctx.closePath()
+      ctx.fill(); ctx.stroke()
+      ctx.beginPath()
+      ctx.moveTo(65, -50); ctx.lineTo(75, -110); ctx.lineTo(20, -75); ctx.closePath()
+      ctx.fill(); ctx.stroke()
+
+      // Inner Ear
+      ctx.fillStyle = '#f472b6'
+      ctx.beginPath()
+      ctx.moveTo(-60, -55); ctx.lineTo(-68, -100); ctx.lineTo(-25, -73); ctx.closePath()
+      ctx.fill()
+      ctx.beginPath()
+      ctx.moveTo(60, -55); ctx.lineTo(68, -100); ctx.lineTo(25, -73); ctx.closePath()
+      ctx.fill()
+
+      // Head
+      ctx.fillStyle = '#e2e8f0'
+      ctx.strokeStyle = '#f472b6'
+      ctx.beginPath()
+      ctx.ellipse(0, -10, 75, 65, 0, 0, Math.PI * 2)
+      ctx.fill(); ctx.stroke()
+
+      // Whiskers
+      ctx.strokeStyle = '#94a3b8'
+      ctx.lineWidth = 2
+      ctx.beginPath(); ctx.moveTo(-65, -5); ctx.lineTo(-95, -10); ctx.stroke()
+      ctx.beginPath(); ctx.moveTo(-65, 5); ctx.lineTo(-95, 10); ctx.stroke()
+      ctx.beginPath(); ctx.moveTo(65, -5); ctx.lineTo(95, -10); ctx.stroke()
+      ctx.beginPath(); ctx.moveTo(65, 5); ctx.lineTo(95, 10); ctx.stroke()
+
+      // Eyes
+      ctx.fillStyle = '#334155'
+      ctx.strokeStyle = '#334155'
+      ctx.lineWidth = 3
+      if (blinkL > 0.5) {
+        ctx.beginPath(); ctx.arc(-30, -20, 10, Math.PI, 0, false); ctx.stroke()
+      } else {
+        ctx.beginPath(); ctx.ellipse(-30, -20, 12, 16, 0, 0, Math.PI * 2); ctx.fill()
+        ctx.fillStyle = '#ffffff'
+        ctx.beginPath(); ctx.arc(-26, -24, 4, 0, Math.PI * 2); ctx.fill()
+      }
+      ctx.fillStyle = '#334155'
+      if (blinkR > 0.5) {
+        ctx.beginPath(); ctx.arc(30, -20, 10, Math.PI, 0, false); ctx.stroke()
+      } else {
+        ctx.beginPath(); ctx.ellipse(30, -20, 12, 16, 0, 0, Math.PI * 2); ctx.fill()
+        ctx.fillStyle = '#ffffff'
+        ctx.beginPath(); ctx.arc(34, -24, 4, 0, Math.PI * 2); ctx.fill()
+      }
+
+      // Nose
+      ctx.fillStyle = '#f472b6'
+      ctx.beginPath(); ctx.moveTo(-5, 0); ctx.lineTo(5, 0); ctx.lineTo(0, 4); ctx.closePath(); ctx.fill()
+
+      // Mouth
+      if (mouthOpen > 0.1) {
+        const mouthHeight = mouthOpen * 30
+        ctx.fillStyle = '#be185d'
+        ctx.beginPath(); ctx.ellipse(0, 15, 10, mouthHeight, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+        ctx.fillStyle = '#fda4af'
+        ctx.beginPath(); ctx.ellipse(0, 15 + mouthHeight/2, 6, mouthHeight/3, 0, 0, Math.PI * 2); ctx.fill()
+      } else {
+        ctx.strokeStyle = '#334155'
+        ctx.beginPath(); ctx.arc(-5, 8, 5, 0, Math.PI, false); ctx.arc(5, 8, 5, 0, Math.PI, false); ctx.stroke()
+      }
+    } 
+    else if (selectedAvatar === 'demon') {
+      // Neck
+      ctx.fillStyle = '#1e1b4b'
+      ctx.strokeStyle = '#a855f7'
+      ctx.lineWidth = 4
+      ctx.beginPath()
+      ctx.moveTo(-25, 40); ctx.lineTo(-40, 80); ctx.lineTo(40, 80); ctx.lineTo(25, 40); ctx.closePath()
+      ctx.fill(); ctx.stroke()
+
+      // Horns
+      ctx.fillStyle = '#ef4444'
+      ctx.strokeStyle = '#7f1d1d'
+      ctx.lineWidth = 3
+      ctx.beginPath()
+      ctx.moveTo(-50, -60); ctx.quadraticCurveTo(-90, -110, -50, -130); ctx.quadraticCurveTo(-70, -90, -25, -75); ctx.closePath()
+      ctx.fill(); ctx.stroke()
+      ctx.beginPath()
+      ctx.moveTo(50, -60); ctx.quadraticCurveTo(90, -110, 50, -130); ctx.quadraticCurveTo(70, -90, 25, -75); ctx.closePath()
+      ctx.fill(); ctx.stroke()
+
+      // Head
+      ctx.fillStyle = '#090514'
+      ctx.strokeStyle = '#a855f7'
+      ctx.beginPath(); ctx.ellipse(0, -10, 65, 75, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+
+      // Eyes
+      ctx.shadowColor = '#d8b4fe'
+      ctx.shadowBlur = 12
+      if (blinkL > 0.5) {
+        ctx.strokeStyle = '#d8b4fe'; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(-40, -15); ctx.lineTo(-15, -10); ctx.stroke()
+      } else {
+        ctx.fillStyle = '#a855f7'; ctx.beginPath(); ctx.moveTo(-45, -25); ctx.lineTo(-15, -15); ctx.lineTo(-35, -5); ctx.closePath(); ctx.fill()
+      }
+      if (blinkR > 0.5) {
+        ctx.strokeStyle = '#d8b4fe'; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(15, -10); ctx.lineTo(40, -15); ctx.stroke()
+      } else {
+        ctx.fillStyle = '#a855f7'; ctx.beginPath(); ctx.moveTo(45, -25); ctx.lineTo(15, -15); ctx.lineTo(35, -5); ctx.closePath(); ctx.fill()
+      }
+      ctx.shadowBlur = 0
+
+      // Fangs
+      ctx.strokeStyle = '#a855f7'; ctx.lineWidth = 2
+      if (mouthOpen > 0.1) {
+        const mouthHeight = mouthOpen * 25
+        ctx.fillStyle = '#ef4444'
+        ctx.beginPath(); ctx.ellipse(0, 20, 15, mouthHeight, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+        ctx.fillStyle = '#ffffff'
+        ctx.beginPath(); ctx.moveTo(-10, 20 - mouthHeight); ctx.lineTo(-5, 20 - mouthHeight + 8); ctx.lineTo(0, 20 - mouthHeight); ctx.closePath(); ctx.fill()
+        ctx.beginPath(); ctx.moveTo(0, 20 - mouthHeight); ctx.lineTo(5, 20 - mouthHeight + 8); ctx.lineTo(10, 20 - mouthHeight); ctx.closePath(); ctx.fill()
+      } else {
+        ctx.beginPath(); ctx.moveTo(-20, 20); ctx.lineTo(0, 15); ctx.lineTo(20, 20); ctx.stroke()
+      }
+    }
+
+    ctx.restore()
+  }
+
+  // Record AI Avatar canvas session
+  const toggleAvatarRecording = () => {
+    if (isRecordingAvatar) {
+      if (avatarRecorderRef.current && avatarRecorderRef.current.state !== 'inactive') {
+        avatarRecorderRef.current.stop()
+      }
+      setIsRecordingAvatar(false)
+    } else {
+      const canvas = avatarCanvasRef.current
+      if (!canvas) return
+      
+      const canvasStream = canvas.captureStream(30)
+      const combinedTracks = [...canvasStream.getVideoTracks()]
+      
+      const micStream = webcamVideoRef.current?.srcObject as MediaStream
+      if (micStream && micStream.getAudioTracks().length > 0) {
+        combinedTracks.push(micStream.getAudioTracks()[0])
+      }
+      
+      const combinedStream = new MediaStream(combinedTracks)
+      let recorder: MediaRecorder
+      try {
+        recorder = new MediaRecorder(combinedStream, { mimeType: 'video/webm' })
+      } catch (e) {
+        recorder = new MediaRecorder(combinedStream)
+      }
+      
+      avatarChunksRef.current = []
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) avatarChunksRef.current.push(e.data)
+      }
+      
+      recorder.onstop = () => {
+        const blob = new Blob(avatarChunksRef.current, { type: 'video/webm' })
+        const url = URL.createObjectURL(blob)
+        
+        const newClip: VideoClip = {
+          id: `avatar-${Date.now()}`,
+          file: new File([blob], `avatar_puppet_${Date.now()}.webm`, { type: 'video/webm' }),
+          url,
+          name: `AI Puppet (${selectedAvatar})`,
+          duration: avatarRecordingDuration || 5,
+          startTime: 0,
+          endTime: avatarRecordingDuration || 5,
+          brightness: 100,
+          contrast: 100,
+          saturate: 100,
+          blur: 0,
+          grayscale: 0,
+          sepia: 0,
+          hueRotate: 0,
+          playbackSpeed: 1.0,
+          chromaKeyEnabled: true,
+          chromaKeyColor: '#0f172a', // slate-900 background makes green-screen keying trivial!
+          chromaKeyThreshold: 35,
+          transitionType: 'none',
+          transitionDuration: 1.0
+        }
+        
+        setClips(prev => [...prev, newClip])
+        setSelectedClipId(newClip.id)
+        
+        // Stop camera tracks to save resources
+        stopWebcamTracking()
+      }
+      
+      setAvatarRecordingDuration(0)
+      avatarRecorderRef.current = recorder
+      recorder.start()
+      setIsRecordingAvatar(true)
+    }
+  }
+
+  // Timer Effect for Avatar recording duration
+  useEffect(() => {
+    let interval: any = null
+    if (isRecordingAvatar) {
+      interval = setInterval(() => {
+        setAvatarRecordingDuration(prev => prev + 1)
+      }, 1000)
+    } else {
+      clearInterval(interval)
+    }
+    return () => clearInterval(interval)
+  }, [isRecordingAvatar])
+
+  // Cleanup webcam tracks on exit
+  useEffect(() => {
+    return () => {
+      stopWebcamTracking()
+    }
+  }, [])
+
   const handleTextLayerAdd = () => {
     const newText: TextLayer = {
       id: `text-${Date.now()}`,
@@ -1428,6 +1895,7 @@ function Home() {
               {/* Double Buffering Videos (Hidden) */}
               <video ref={videoRefA} className="hidden" crossOrigin="anonymous" playsInline muted />
               <video ref={videoRefB} className="hidden" crossOrigin="anonymous" playsInline muted />
+              <video ref={webcamVideoRef} className="hidden" playsInline muted />
               <audio ref={audioMusicRef} className="hidden" src={musicUrl} />
 
               {/* Composited Preview Canvas */}
@@ -2133,8 +2601,83 @@ function Home() {
                   {/* AI Tools Tab */}
                   {activeTab === 'ai' && (
                     <div className="space-y-6 max-h-[500px] overflow-y-auto pr-1">
-                      {/* Section 1: Auto Transcriptions & Captions */}
+                      
+                      {/* Section 1: Webcam Puppeteer Character Clone */}
                       <div className="space-y-3">
+                        <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                          <Mic className="h-3.5 w-3.5 text-purple-400" />
+                          AI Visual Character Clone
+                        </h4>
+                        <p className="text-[11px] text-slate-500">
+                          Puppeteer an AI character with your camera. Tilt your head, blink, and speak.
+                        </p>
+
+                        <div className="bg-slate-950/30 border border-slate-900 rounded-xl p-3.5 space-y-3">
+                          {/* Character Select */}
+                          <div className="space-y-1">
+                            <label className="text-[9px] uppercase text-slate-500 font-semibold block">Select Character</label>
+                            <div className="grid grid-cols-3 gap-1.5">
+                              {(['robot', 'kitty', 'demon'] as const).map((avatar) => (
+                                <button
+                                  key={avatar}
+                                  onClick={() => setSelectedAvatar(avatar)}
+                                  className={`rounded py-1.5 text-xs font-semibold uppercase transition-all cursor-pointer ${
+                                    selectedAvatar === avatar
+                                      ? 'bg-purple-600 text-white'
+                                      : 'bg-slate-900 text-slate-400 hover:text-slate-200'
+                                  }`}
+                                >
+                                  {avatar}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Canvas Preview */}
+                          <div className="relative aspect-square w-full rounded-lg overflow-hidden border border-slate-900 bg-slate-950 flex items-center justify-center">
+                            <canvas
+                              ref={avatarCanvasRef}
+                              className="w-full h-full object-contain"
+                            />
+                            {!isWebcamActive && (
+                              <div className="absolute inset-0 flex flex-col items-center justify-center p-4 bg-slate-950/80 text-center gap-2">
+                                <Brain className="h-8 w-8 text-purple-500 animate-pulse" />
+                                <span className="text-[11px] text-slate-400">Webcam tracking is off</span>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Control Buttons */}
+                          <div className="flex gap-2">
+                            <button
+                              onClick={toggleWebcam}
+                              className={`flex-1 rounded-lg py-2 text-xs font-semibold border transition-all cursor-pointer ${
+                                isWebcamActive
+                                  ? 'bg-slate-900 border-slate-800 text-red-400 hover:text-red-300'
+                                  : 'bg-purple-600 border-purple-500 text-white hover:bg-purple-500'
+                              }`}
+                            >
+                              {isWebcamActive ? 'Stop Webcam' : 'Start Webcam'}
+                            </button>
+
+                            {isWebcamActive && (
+                              <button
+                                onClick={toggleAvatarRecording}
+                                className={`flex-1 rounded-lg py-2 text-xs font-semibold border transition-all cursor-pointer ${
+                                  isRecordingAvatar
+                                    ? 'bg-red-600 border-red-500 text-white animate-pulse'
+                                    : 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white'
+                                }`}
+                              >
+                                {isRecordingAvatar ? `Stop (${avatarRecordingDuration}s)` : 'Record Puppet'}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Section 2: Auto Transcriptions & Captions */}
+                      <div className="pt-4 border-t border-slate-900/50 space-y-3">
                         <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
                           <Brain className="h-3.5 w-3.5 text-purple-400" />
                           Auto Captions & Transcription
@@ -2173,7 +2716,7 @@ function Home() {
                         )}
                       </div>
 
-                      {/* Section 2: Filler word cutter */}
+                      {/* Section 3: Filler word cutter */}
                       {selectedClipId && (() => {
                         const clip = clips.find(c => c.id === selectedClipId)
                         if (!clip) return null
@@ -2205,7 +2748,7 @@ function Home() {
                         )
                       })()}
 
-                      {/* Section 3: TTS & Voice Cloning */}
+                      {/* Section 4: TTS & Voice Cloning */}
                       <div className="pt-4 border-t border-slate-900/50 space-y-4">
                         <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
                           <Mic className="h-3.5 w-3.5 text-purple-400" />
