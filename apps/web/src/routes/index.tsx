@@ -24,7 +24,9 @@ import {
   ArrowUp,
   ArrowDown,
   Layers,
-  Settings
+  Settings,
+  Mic,
+  Brain
 } from 'lucide-react'
 
 export const Route = createFileRoute('/')({ component: Home })
@@ -53,6 +55,14 @@ interface VideoClip {
   // Transitions
   transitionType: 'none' | 'fade' | 'fade-to-black'
   transitionDuration: number
+  // AI Transcription results
+  transcription?: {
+    text: string
+    chunks: Array<{
+      text: string
+      timestamp: [number, number]
+    }>
+  }
 }
 
 interface TextLayer {
@@ -62,6 +72,8 @@ interface TextLayer {
   fontSize: number
   x: number // percentage 0-100
   y: number // percentage 0-100
+  startTime?: number // timing (seconds) relative to global timeline
+  endTime?: number
 }
 
 interface ImageLayer {
@@ -74,11 +86,159 @@ interface ImageLayer {
   scale: number // percentage size multiplier 5-100
 }
 
+// Granular overlap-add pitch shifter to modulate voice timbre while preserving duration
+function pitchShiftBuffer(audioBuffer: AudioBuffer, semitones: number, audioCtx: AudioContext): AudioBuffer {
+  const pitchRatio = Math.pow(2, semitones / 12)
+  const numChannels = audioBuffer.numberOfChannels
+  const sampleRate = audioBuffer.sampleRate
+  
+  if (Math.abs(pitchRatio - 1) < 0.05) return audioBuffer
+  
+  const inputData = audioBuffer.getChannelData(0)
+  const outputLength = Math.floor(inputData.length / pitchRatio)
+  const outputBuffer = audioCtx.createBuffer(numChannels, outputLength, sampleRate)
+  const outputData = outputBuffer.getChannelData(0)
+  
+  const grainSize = 2205 // ~50ms grain
+  const overlap = 1102   // 50% overlap
+  
+  for (let i = 0; i < outputData.length; i++) {
+    outputData[i] = 0
+  }
+  
+  let outPos = 0
+  let inPos = 0
+  while (inPos < inputData.length - grainSize && outPos < outputData.length - grainSize) {
+    for (let j = 0; j < grainSize; j++) {
+      const readPos = Math.floor(inPos + j * pitchRatio)
+      if (readPos < inputData.length) {
+        // Apply Hanning window
+        const windowCoeff = 0.5 * (1 - Math.cos((2 * Math.PI * j) / (grainSize - 1)))
+        outputData[outPos + j] += inputData[readPos] * windowCoeff
+      }
+    }
+    outPos += overlap
+    inPos += Math.floor(overlap * pitchRatio)
+  }
+  return outputBuffer
+}
+
+// Simple Autocorrelation pitch detector to find voice pitch frequency in Hz
+function detectPitch(audioBuffer: AudioBuffer): number {
+  const signal = audioBuffer.getChannelData(0)
+  const sampleRate = audioBuffer.sampleRate
+  
+  let maxCorrelation = -1
+  let bestLag = -1
+  
+  // Fundamental voice range search: 70Hz (low male) to 400Hz (high female)
+  const minLag = Math.floor(sampleRate / 400)
+  const maxLag = Math.floor(sampleRate / 70)
+  
+  for (let lag = minLag; lag < maxLag; lag++) {
+    let correlation = 0
+    let count = 0
+    for (let i = 0; i < signal.length - lag; i += 2) {
+      correlation += signal[i] * signal[i + lag]
+      count++
+    }
+    correlation /= count
+    if (correlation > maxCorrelation) {
+      maxCorrelation = correlation
+      bestLag = lag
+    }
+  }
+  
+  if (bestLag > 0) {
+    return Math.round(sampleRate / bestLag)
+  }
+  return 150 // fallback (average speech frequency)
+}
+
+// In-browser WAV encoder to convert an AudioBuffer to a downloadable file Blob
+function audioBufferToWav(buffer: AudioBuffer): Blob {
+  const numOfChan = buffer.numberOfChannels
+  const sampleRate = buffer.sampleRate
+  const format = 1 // 1 = raw PCM (16-bit)
+  const bitDepth = 16
+  
+  let result: Float32Array
+  if (numOfChan === 2) {
+    result = interleave(buffer.getChannelData(0), buffer.getChannelData(1))
+  } else {
+    result = buffer.getChannelData(0)
+  }
+  
+  const bufferLength = result.length * 2
+  const wavBuffer = new ArrayBuffer(44 + bufferLength)
+  const view = new DataView(wavBuffer)
+  
+  writeString(view, 0, 'RIFF')
+  view.setUint32(4, 36 + bufferLength, true)
+  writeString(view, 8, 'WAVE')
+  writeString(view, 12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, format, true)
+  view.setUint16(22, numOfChan, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * numOfChan * (bitDepth / 8), true)
+  view.setUint16(32, numOfChan * (bitDepth / 8), true)
+  view.setUint16(34, bitDepth, true)
+  writeString(view, 36, 'data')
+  view.setUint32(40, bufferLength, true)
+  
+  floatTo16BitPCM(view, 44, result)
+  return new Blob([view], { type: 'audio/wav' })
+}
+
+function interleave(inputL: Float32Array, inputR: Float32Array): Float32Array {
+  const length = inputL.length + inputR.length
+  const result = new Float32Array(length)
+  let index = 0
+  let inputIndex = 0
+  while (index < length) {
+    result[index++] = inputL[inputIndex]
+    result[index++] = inputR[inputIndex]
+    inputIndex++
+  }
+  return result
+}
+
+function floatTo16BitPCM(output: DataView, offset: number, input: Float32Array) {
+  for (let i = 0; i < input.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, input[i]))
+    output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true)
+  }
+}
+
+function writeString(view: DataView, offset: number, string: string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i))
+  }
+}
+
 function Home() {
   // Monorepo Workspace States
   const [clips, setClips] = useState<VideoClip[]>([])
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState<'clips' | 'ratio' | 'filters' | 'text' | 'stickers'>('clips')
+  const [activeTab, setActiveTab] = useState<'clips' | 'ratio' | 'filters' | 'text' | 'stickers' | 'ai'>('clips')
+
+  // AI Transcription States
+  const [isTranscribing, setIsTranscribing] = useState(false)
+  const [transcriptionProgress, setTranscriptionProgress] = useState(0)
+  const [transcriptionStatusText, setTranscriptionStatusText] = useState('')
+
+  // Voice recording / pitch analyzer cloning states
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false)
+  const [voiceSignatureBuffer, setVoiceSignatureBuffer] = useState<AudioBuffer | null>(null)
+  const [userVoicePitch, setUserVoicePitch] = useState<number | null>(null)
+  const mediaRecorderVoiceRef = useRef<MediaRecorder | null>(null)
+  const voiceChunksRef = useRef<Blob[]>([])
+
+  // TTS Generator States
+  const [ttsText, setTtsText] = useState('Hello, this is my cloned voiceover!')
+  const [selectedBaseVoice, setSelectedBaseVoice] = useState('Brian')
+  const [isGeneratingTts, setIsGeneratingTts] = useState(false)
 
   // Global Timeline States
   const [isPlaying, setIsPlaying] = useState(false)
@@ -352,6 +512,13 @@ function Home() {
 
         // Draw Text layers
         textLayers.forEach(layer => {
+          // Subtitle timing constraint
+          if (layer.startTime !== undefined && layer.endTime !== undefined) {
+            if (globalTime < layer.startTime || globalTime > layer.endTime) {
+              return
+            }
+          }
+
           const scaledFontSize = layer.fontSize * (canvasHeight / 500)
           ctx.font = `bold ${scaledFontSize}px sans-serif`
           ctx.fillStyle = layer.color
@@ -599,6 +766,266 @@ function Home() {
   const updateSelectedClip = (updater: (clip: VideoClip) => Partial<VideoClip>) => {
     if (!selectedClipId) return
     setClips(prev => prev.map(c => c.id === selectedClipId ? { ...c, ...updater(c) } : c))
+  }
+
+  // Voice Recording handlers
+  const toggleVoiceRecording = async () => {
+    if (isRecordingVoice) {
+      if (mediaRecorderVoiceRef.current && mediaRecorderVoiceRef.current.state !== 'inactive') {
+        mediaRecorderVoiceRef.current.stop()
+      }
+      setIsRecordingVoice(false)
+    } else {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+        voiceChunksRef.current = []
+        const recorder = new MediaRecorder(stream)
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) voiceChunksRef.current.push(e.data)
+        }
+        recorder.onstop = async () => {
+          const blob = new Blob(voiceChunksRef.current, { type: 'audio/webm' })
+          const arrayBuffer = await blob.arrayBuffer()
+          const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
+          const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
+          setVoiceSignatureBuffer(audioBuffer)
+          const pitch = detectPitch(audioBuffer)
+          setUserVoicePitch(pitch)
+          stream.getTracks().forEach(t => t.stop())
+        }
+        mediaRecorderVoiceRef.current = recorder
+        recorder.start()
+        setIsRecordingVoice(true)
+        // Auto stop after 3 seconds
+        setTimeout(() => {
+          if (recorder.state !== 'inactive') {
+            recorder.stop()
+            setIsRecordingVoice(false)
+          }
+        }, 3000)
+      } catch (e) {
+        console.error('Error recording voice:', e)
+        alert('Could not access microphone.')
+      }
+    }
+  }
+
+  // Speech to Text logic
+  const handleAutoTranscribeClip = async () => {
+    if (!selectedClipId) return
+    const clip = clips.find(c => c.id === selectedClipId)
+    if (!clip) return
+
+    setIsTranscribing(true)
+    setTranscriptionProgress(0)
+    setTranscriptionStatusText('Extracting audio from video...')
+
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 })
+      const response = await fetch(clip.url)
+      const arrayBuffer = await response.arrayBuffer()
+      setTranscriptionStatusText('Decoding audio data...')
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
+      
+      setTranscriptionStatusText('Spawning Whisper AI worker...')
+      const float32Data = audioBuffer.getChannelData(0)
+
+      const worker = new Worker(
+        new URL('../transcription.worker.ts', import.meta.url),
+        { type: 'module' }
+      )
+
+      worker.onmessage = (event) => {
+        const { status, file, progress, result, error } = event.data
+        if (status === 'progress') {
+          setTranscriptionProgress(Math.round(progress))
+          setTranscriptionStatusText(`Loading Whisper AI model... (${Math.round(progress)}%)`)
+        } else if (status === 'transcribing') {
+          setTranscriptionStatusText('Transcribing audio...')
+          setTranscriptionProgress(60)
+        } else if (status === 'completed') {
+          setTranscriptionStatusText('Completed!')
+          setIsTranscribing(false)
+          worker.terminate()
+          
+          if (result && result.chunks) {
+            // Save transcript to clip
+            setClips(prev => prev.map(c => c.id === clip.id ? { 
+              ...c, 
+              transcription: {
+                text: result.text,
+                chunks: result.chunks.map((ch: any) => ({
+                  text: ch.text,
+                  timestamp: ch.timestamp
+                }))
+              }
+            } : c))
+
+            // Timed Text layers
+            let accumulated = 0
+            for (let i = 0; i < clips.length; i++) {
+              if (clips[i].id === clip.id) break
+              accumulated += (clips[i].endTime - clips[i].startTime)
+            }
+
+            const newLayers: TextLayer[] = result.chunks.map((ch: any, idx: number) => {
+              const start = accumulated + (ch.timestamp[0] - clip.startTime)
+              const end = accumulated + (ch.timestamp[1] - clip.startTime)
+              return {
+                id: `caption-${Date.now()}-${idx}`,
+                text: ch.text.trim(),
+                color: '#fbbf24', // yellow captions
+                fontSize: 20,
+                x: 50,
+                y: 82, // bottom center placement
+                startTime: Math.max(0, start),
+                endTime: Math.max(0, end)
+              }
+            })
+
+            setTextLayers(prev => [...prev, ...newLayers])
+          }
+        } else if (status === 'error') {
+          setIsTranscribing(false)
+          alert(`Transcription worker error: ${error}`)
+          worker.terminate()
+        }
+      }
+
+      worker.postMessage({ audio: float32Data })
+
+    } catch (err: any) {
+      console.error(err)
+      setIsTranscribing(false)
+      alert(`Transcription failed: ${err.message || String(err)}`)
+    }
+  }
+
+  // Jump-Cut Filler Word Cutter
+  const handleTrimFillerWords = () => {
+    if (!selectedClipId) return
+    const clip = clips.find(c => c.id === selectedClipId)
+    if (!clip || !clip.transcription || !clip.transcription.chunks) {
+      alert("Please generate auto captions first to analyze the speech.")
+      return
+    }
+
+    const chunks = clip.transcription.chunks
+    const fillerRegex = /\b(um|uh|ah|eh|err|like)\b/i
+
+    const garbageIntervals: Array<[number, number]> = []
+    chunks.forEach(ch => {
+      if (fillerRegex.test(ch.text) && ch.timestamp) {
+        garbageIntervals.push([ch.timestamp[0], ch.timestamp[1]])
+      }
+    })
+
+    if (garbageIntervals.length === 0) {
+      alert("No verbal fillers ('um', 'uh', 'ah', 'like', 'err') detected in this clip!")
+      return
+    }
+
+    const activeStart = clip.startTime
+    const activeEnd = clip.endTime
+
+    const filteredGarbage = garbageIntervals
+      .map(([s, e]) => [Math.max(activeStart, s), Math.min(activeEnd, e)] as [number, number])
+      .filter(([s, e]) => e - s > 0.05)
+
+    filteredGarbage.sort((a, b) => a[0] - b[0])
+    const mergedGarbage: Array<[number, number]> = []
+    for (const interval of filteredGarbage) {
+      if (mergedGarbage.length === 0) {
+        mergedGarbage.push(interval)
+      } else {
+        const last = mergedGarbage[mergedGarbage.length - 1]
+        if (interval[0] <= last[1]) {
+          last[1] = Math.max(last[1], interval[1])
+        } else {
+          mergedGarbage.push(interval)
+        }
+      }
+    }
+
+    const cleanIntervals: Array<[number, number]> = []
+    let currentStart = activeStart
+
+    for (const [gStart, gEnd] of mergedGarbage) {
+      if (gStart > currentStart + 0.1) {
+        cleanIntervals.push([currentStart, gStart])
+      }
+      currentStart = gEnd
+    }
+
+    if (activeEnd > currentStart + 0.1) {
+      cleanIntervals.push([currentStart, activeEnd])
+    }
+
+    if (cleanIntervals.length === 0) {
+      alert("Auto trim would delete the entire clip! Trimming aborted.")
+      return
+    }
+
+    const clipIndex = clips.findIndex(c => c.id === selectedClipId)
+    const slicedClips: VideoClip[] = cleanIntervals.map((interval, idx) => ({
+      ...clip,
+      id: `clip-${Date.now()}-cut-${idx}`,
+      startTime: interval[0],
+      endTime: interval[1],
+      name: `${clip.name} (Clean ${idx + 1})`
+    }))
+
+    const updatedClips = [...clips]
+    updatedClips.splice(clipIndex, 1, ...slicedClips)
+    setClips(updatedClips)
+    setSelectedClipId(slicedClips[0].id)
+    alert(`Successfully cut out ${mergedGarbage.length} verbal filler(s). Split clip into ${slicedClips.length} clean segment(s).`)
+  }
+
+  // TTS + Voice Cloning generator
+  const handleGenerateTtsVoiceover = async () => {
+    if (!ttsText.trim()) return
+    setIsGeneratingTts(true)
+
+    try {
+      const text = encodeURIComponent(ttsText)
+      const ttsUrl = `https://api.streamelements.com/api/v2/speech?voice=${selectedBaseVoice}&text=${text}`
+      
+      const res = await fetch(ttsUrl)
+      if (!res.ok) throw new Error('Failed to retrieve TTS audio.')
+      
+      const arrayBuffer = await res.arrayBuffer()
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
+      const rawAudioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
+      
+      let finalAudioBuffer = rawAudioBuffer
+
+      // Apply Voice Cloning pitch modulator
+      if (userVoicePitch) {
+        // Base voice pitch approximations: 
+        // Female voices like Amy, Salli are ~200Hz.
+        // Male voices like Brian, Joey are ~110Hz.
+        const baseFemaleVoices = ['Amy', 'Salli', 'Kendra', 'Kimberly', 'Emma', 'Nicole', 'Mizuki', 'Carla', 'Celine']
+        const basePitch = baseFemaleVoices.includes(selectedBaseVoice) ? 200 : 110
+        const semitones = 12 * Math.log2(userVoicePitch / basePitch)
+        
+        finalAudioBuffer = pitchShiftBuffer(rawAudioBuffer, semitones, audioCtx)
+      }
+
+      // Convert buffer to WAV file blob
+      const wavBlob = audioBufferToWav(finalAudioBuffer)
+      const wavFile = new File([wavBlob], `voiceover_${Date.now()}.wav`, { type: 'audio/wav' })
+      const wavUrl = URL.createObjectURL(wavBlob)
+
+      setMusicFile(wavFile)
+      setMusicUrl(wavUrl)
+      setIsGeneratingTts(false)
+      alert('Successfully generated TTS voiceover and loaded it as background track!')
+    } catch (e: any) {
+      console.error(e)
+      setIsGeneratingTts(false)
+      alert(`Voice generator failed: ${e.message || String(e)}`)
+    }
   }
 
   const handleTextLayerAdd = () => {
@@ -901,6 +1328,13 @@ function Home() {
 
           // Draw Texts
           textLayers.forEach(layer => {
+            // Subtitle timing constraint
+            if (layer.startTime !== undefined && layer.endTime !== undefined) {
+              if (currentExportTime < layer.startTime || currentExportTime > layer.endTime) {
+                return
+              }
+            }
+
             const scaledFontSize = layer.fontSize * (canvasHeight / 500)
             ctx.font = `bold ${scaledFontSize}px sans-serif`
             ctx.fillStyle = layer.color
@@ -1171,7 +1605,7 @@ function Home() {
             <div className="rounded-2xl border border-slate-900 bg-slate-900/30 p-6 backdrop-blur-sm flex-1 flex flex-col justify-between overflow-y-auto">
               <div className="space-y-6">
                 {/* Navigation Tabs */}
-                <div className="grid grid-cols-5 gap-1 rounded-xl bg-slate-950 p-1 border border-slate-900">
+                <div className="grid grid-cols-6 gap-1 rounded-xl bg-slate-950 p-1 border border-slate-900">
                   <button
                     onClick={() => setActiveTab('clips')}
                     className={`flex flex-col items-center gap-1 rounded-lg py-2 text-[10px] transition-colors ${
@@ -1216,6 +1650,15 @@ function Home() {
                   >
                     <ImageIcon className="h-4 w-4" />
                     <span>Stickers</span>
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('ai')}
+                    className={`flex flex-col items-center gap-1 rounded-lg py-2 text-[10px] transition-colors ${
+                      activeTab === 'ai' ? 'bg-slate-900 text-purple-400' : 'text-slate-500 hover:text-slate-300'
+                    }`}
+                  >
+                    <Brain className="h-4 w-4" />
+                    <span>AI Tools</span>
                   </button>
                 </div>
 
@@ -1683,6 +2126,176 @@ function Home() {
                             </div>
                           </div>
                         )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* AI Tools Tab */}
+                  {activeTab === 'ai' && (
+                    <div className="space-y-6 max-h-[500px] overflow-y-auto pr-1">
+                      {/* Section 1: Auto Transcriptions & Captions */}
+                      <div className="space-y-3">
+                        <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                          <Brain className="h-3.5 w-3.5 text-purple-400" />
+                          Auto Captions & Transcription
+                        </h4>
+                        <p className="text-[11px] text-slate-500">
+                          Extract speech from the selected clip and place yellow timed captions on the screen.
+                        </p>
+                        
+                        {selectedClipId ? (
+                          <div className="space-y-3">
+                            {isTranscribing ? (
+                              <div className="space-y-2 bg-slate-950/30 border border-slate-900 rounded-lg p-3">
+                                <div className="flex justify-between text-[10px] font-mono text-purple-400">
+                                  <span className="truncate max-w-[170px]">{transcriptionStatusText}</span>
+                                  <span>{transcriptionProgress}%</span>
+                                </div>
+                                <div className="h-1.5 w-full bg-slate-950 rounded-full overflow-hidden border border-slate-900">
+                                  <div 
+                                    className="h-full bg-purple-600 transition-all duration-300"
+                                    style={{ width: `${transcriptionProgress}%` }}
+                                  />
+                                </div>
+                              </div>
+                            ) : (
+                              <button
+                                onClick={handleAutoTranscribeClip}
+                                className="w-full flex items-center justify-center gap-2 rounded-lg bg-purple-600 hover:bg-purple-500 py-2.5 text-xs font-semibold text-white transition-all shadow-md shadow-purple-500/10 cursor-pointer"
+                              >
+                                <Sparkles className="h-3.5 w-3.5" />
+                                Generate Auto Captions
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <p className="text-xs text-slate-600 italic">Select a clip on the timeline first.</p>
+                        )}
+                      </div>
+
+                      {/* Section 2: Filler word cutter */}
+                      {selectedClipId && (() => {
+                        const clip = clips.find(c => c.id === selectedClipId)
+                        if (!clip) return null
+                        
+                        return (
+                          <div className="pt-4 border-t border-slate-900/50 space-y-3">
+                            <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                              <Scissors className="h-3.5 w-3.5 text-purple-400" />
+                              Remove Verbal Garbage
+                            </h4>
+                            <p className="text-[11px] text-slate-500">
+                              Detect and trim out spoken filler words (like "um", "uh", "ah", "like", "err") to clean up your audio automatically.
+                            </p>
+
+                            {clip.transcription ? (
+                              <button
+                                onClick={handleTrimFillerWords}
+                                className="w-full flex items-center justify-center gap-2 rounded-lg bg-pink-600 hover:bg-pink-500 py-2.5 text-xs font-semibold text-white transition-all shadow-md shadow-pink-500/10 cursor-pointer"
+                              >
+                                <Scissors className="h-3.5 w-3.5" />
+                                Cut Verbal Fillers
+                              </button>
+                            ) : (
+                              <div className="rounded-lg border border-slate-900 bg-slate-950/20 p-3 text-[11px] text-slate-500 italic">
+                                Run "Generate Auto Captions" above first to enable filler removal on this clip.
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })()}
+
+                      {/* Section 3: TTS & Voice Cloning */}
+                      <div className="pt-4 border-t border-slate-900/50 space-y-4">
+                        <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                          <Mic className="h-3.5 w-3.5 text-purple-400" />
+                          Voice Cloning & TTS
+                        </h4>
+                        <p className="text-[11px] text-slate-500">
+                          Create a custom voiceover. Record a 3-second sample of your voice to clone its pitch and timbre characteristics.
+                        </p>
+
+                        {/* Mic Recorder */}
+                        <div className="bg-slate-950/30 border border-slate-900 rounded-xl p-4 space-y-3">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs text-slate-400 font-medium">Voice Signature</span>
+                            {userVoicePitch ? (
+                              <span className="text-[10px] bg-green-500/10 border border-green-500/20 text-green-400 rounded px-1.5 py-0.5 font-mono">
+                                Cloned ({userVoicePitch} Hz)
+                              </span>
+                            ) : (
+                              <span className="text-[10px] text-slate-600 italic">No signature recorded</span>
+                            )}
+                          </div>
+
+                          <button
+                            onClick={toggleVoiceRecording}
+                            className={`w-full flex items-center justify-center gap-2 rounded-lg py-2.5 text-xs font-semibold transition-all border cursor-pointer ${
+                              isRecordingVoice
+                                ? 'bg-red-600 border-red-500 text-white animate-pulse'
+                                : voiceSignatureBuffer
+                                ? 'bg-slate-900 border-slate-800 text-slate-300 hover:text-white'
+                                : 'bg-purple-600 border-purple-500 text-white hover:bg-purple-500'
+                            }`}
+                          >
+                            <Mic className="h-3.5 w-3.5" />
+                            {isRecordingVoice 
+                              ? 'Recording... Speak now!' 
+                              : voiceSignatureBuffer 
+                              ? 'Record Voice Signature again (3s)' 
+                              : 'Record Voice Signature (3s)'
+                            }
+                          </button>
+                        </div>
+
+                        {/* TTS Generator */}
+                        <div className="space-y-3">
+                          <div className="space-y-1">
+                            <label className="text-[10px] uppercase text-slate-500 font-semibold block">Base Synthetic Voice</label>
+                            <select
+                              value={selectedBaseVoice}
+                              onChange={(e) => setSelectedBaseVoice(e.target.value)}
+                              className="w-full rounded-lg bg-slate-950 border border-slate-900 px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-purple-500 cursor-pointer"
+                            >
+                              <option value="Brian">Brian (Polly UK Male - Recommended)</option>
+                              <option value="Amy">Amy (Polly UK Female)</option>
+                              <option value="Emma">Emma (UK Female)</option>
+                              <option value="Joey">Joey (Polly US Male)</option>
+                              <option value="Kendra">Kendra (Polly US Female)</option>
+                              <option value="Salli">Salli (Polly US Female)</option>
+                              <option value="Ivy">Ivy (US Child Female)</option>
+                              <option value="Justin">Justin (US Child Male)</option>
+                            </select>
+                          </div>
+
+                          <div className="space-y-1">
+                            <label className="text-[10px] uppercase text-slate-500 font-semibold block">Voiceover Text</label>
+                            <textarea
+                              value={ttsText}
+                              onChange={(e) => setTtsText(e.target.value)}
+                              placeholder="Type something for the synthetic voice to speak..."
+                              className="w-full h-16 rounded-lg bg-slate-950 border border-slate-900 px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-purple-500 resize-none"
+                            />
+                          </div>
+
+                          <button
+                            onClick={handleGenerateTtsVoiceover}
+                            disabled={isGeneratingTts || !ttsText.trim()}
+                            className="w-full flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-purple-600 to-pink-500 hover:opacity-90 py-3 text-xs font-bold text-white transition-all shadow-md shadow-purple-500/10 disabled:opacity-50 cursor-pointer"
+                          >
+                            {isGeneratingTts ? (
+                              <>
+                                <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                                <span>Generating Voiceover...</span>
+                              </>
+                            ) : (
+                              <>
+                                <Sparkles className="h-3.5 w-3.5" />
+                                <span>{voiceSignatureBuffer ? 'Generate Cloned Voiceover' : 'Generate TTS Voiceover'}</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   )}
