@@ -18,7 +18,7 @@ import {
   Maximize, 
   Plus, 
   Sparkles, 
-  RotateCcw,
+  RotateCcw, 
   Music,
   Image as ImageIcon,
   ArrowUp,
@@ -448,6 +448,11 @@ function Home() {
     setClips(newClips)
   }
 
+  // File Input Trigger helper
+  const triggerFileInput = () => {
+    fileInputRef.current?.click()
+  }
+
   // File Upload Handlers
   const handleAddClipFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
@@ -608,6 +613,23 @@ function Home() {
     setTextLayers(prev => [...prev, newText])
     setSelectedTextId(newText.id)
     setActiveTab('text')
+  }
+
+  const handleUpdateTextValue = (id: string, value: string) => {
+    setTextLayers(prev => prev.map(t => t.id === id ? { ...t, text: value } : t))
+  }
+
+  const handleUpdateTextSize = (id: string, size: number) => {
+    setTextLayers(prev => prev.map(t => t.id === id ? { ...t, fontSize: size } : t))
+  }
+
+  const handleUpdateTextColor = (id: string, color: string) => {
+    setTextLayers(prev => prev.map(t => t.id === id ? { ...t, color } : t))
+  }
+
+  const handleDeleteTextLayer = (id: string) => {
+    setTextLayers(prev => prev.filter(t => t.id !== id))
+    if (selectedTextId === id) setSelectedTextId(null)
   }
 
   // Web Audio Mixer + Canvas Frame Export Loop
@@ -913,13 +935,24 @@ function Home() {
     }
   }
 
+  const formatTime = (time: number) => {
+    const minutes = Math.floor(time / 60)
+    const seconds = Math.floor(time % 60)
+    const centiseconds = Math.floor((time % 1) * 100)
+    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${centiseconds.toString().padStart(2, '0')}`
+  }
+
+  const colors = [
+    '#ffffff', '#000000', '#f87171', '#fbbf24', '#34d399', '#60a5fa', '#a78bfa', '#f472b6'
+  ]
+
   return (
     <div className="flex flex-col min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-purple-600 selection:text-white">
       {/* Header */}
       <header className="sticky top-0 z-50 flex items-center justify-between border-b border-slate-900 bg-slate-950/80 px-6 py-4 backdrop-blur-md">
         <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-purple-600 to-pink-500 shadow-lg shadow-purple-500/20">
-            <Scissors className="h-5 w-5 text-white animate-pulse" />
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-purple-600 to-pink-500 shadow-lg shadow-purple-500/20 animate-pulse">
+            <Scissors className="h-5 w-5 text-white" />
           </div>
           <div>
             <h1 className="text-lg font-bold tracking-tight bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">
